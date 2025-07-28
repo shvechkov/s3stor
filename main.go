@@ -93,7 +93,7 @@ func main() {
 	}
 
 	if len(os.Args) < 2 {
-		fmt.Println("Usage: go run main.go <sync|ls|get|map|snapshot|delete-snapshot|cleanup-blocks> [args...]")
+		fmt.Println("Usage: go run main.go <sync|ls|get|map|snapshot|delete-snapshot|cleanup-blocks|delete> [args...]")
 		os.Exit(1)
 	}
 
@@ -206,6 +206,18 @@ func main() {
 			hostname = "unknown"
 		}
 		cleanupBlocks(ctx, client, hostname, providerConfig)
+	case "delete":
+		if len(os.Args) != 3 {
+			fmt.Println("Usage: delete <file_name>")
+			os.Exit(1)
+		}
+		fileName := os.Args[2]
+		hostname, err := os.Hostname()
+		if err != nil {
+			log.Printf("Failed to get hostname: %v, using 'unknown'", err)
+			hostname = "unknown"
+		}
+		deleteFile(ctx, client, hostname, fileName, providerConfig)
 	default:
 		fmt.Println("Unknown command:", cmd)
 		os.Exit(1)
@@ -886,6 +898,243 @@ func cleanupBlocks(ctx context.Context, client *s3.Client, owner string, cfg S3P
 	}
 
 	// 3. List all blocks and delete unreferenced ones
+	blockPaginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(cfg.BucketName),
+		Prefix: aws.String("blocks/"),
+	})
+	var deletedBlocks int
+	for blockPaginator.HasMorePages() {
+		page, err := blockPaginator.NextPage(ctx)
+		if err != nil {
+			log.Printf("Failed to list blocks: %v", err)
+			continue
+		}
+		for _, obj := range page.Contents {
+			blockHash := strings.TrimPrefix(*obj.Key, "blocks/")
+			if _, referenced := referencedBlocks[blockHash]; !referenced {
+				_, err := client.DeleteObject(ctx, &s3.DeleteObjectInput{
+					Bucket: aws.String(cfg.BucketName),
+					Key:    obj.Key,
+				})
+				if err != nil {
+					log.Printf("Failed to delete block %s: %v", blockHash, err)
+					continue
+				}
+				fmt.Printf("Deleted unreferenced block: %s\n", blockHash)
+				deletedBlocks++
+			}
+		}
+	}
+
+	fmt.Printf("Block cleanup completed: %d blocks deleted\n", deletedBlocks)
+}
+
+func deleteFile(ctx context.Context, client *s3.Client, owner, fileName string, cfg S3ProviderConfig) {
+	// Check if file is in any snapshot
+	snapshotFiles := make(map[string]struct{})
+	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(cfg.BucketName),
+		Prefix: aws.String("snapshots/"),
+	})
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			log.Printf("Failed to list snapshots: %v", err)
+			continue
+		}
+		for _, obj := range page.Contents {
+			if strings.HasSuffix(*obj.Key, "/catalog.json") {
+				snapshotCatalogKey := *obj.Key
+				out, err := client.GetObject(ctx, &s3.GetObjectInput{
+					Bucket: aws.String(cfg.BucketName),
+					Key:    aws.String(snapshotCatalogKey),
+				})
+				if err != nil {
+					log.Printf("Failed to get snapshot catalog %s: %v", snapshotCatalogKey, err)
+					continue
+				}
+				var snapshot SnapshotCatalog
+				if err := json.NewDecoder(out.Body).Decode(&snapshot); err != nil {
+					log.Printf("Failed to parse snapshot catalog %s: %v", snapshotCatalogKey, err)
+					out.Body.Close()
+					continue
+				}
+				out.Body.Close()
+				for _, entry := range snapshot.Files {
+					snapshotFiles[entry.FileName] = struct{}{}
+				}
+			}
+		}
+	}
+
+	// if _, inSnapshot := snapshotFiles[fileName]; inSnapshot {
+	// 	fmt.Printf("Cannot delete %s: referenced in a snapshot\n", fileName)
+	// 	return
+	// }
+
+	// Acquire global catalog lock
+	catalogLockKey := "locks/global/catalog.lock"
+	if err := acquireLock(ctx, client, catalogLockKey, owner, cfg); err != nil {
+		log.Fatalf("Failed to acquire catalog lock: %v", err)
+	}
+	defer releaseLock(ctx, client, catalogLockKey, cfg)
+
+	// Read global catalog
+	var catalog []CatalogEntry
+	var targetEntry *CatalogEntry
+	globalCatalogOut, err := client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(cfg.BucketName),
+		Key:    aws.String(cfg.CatalogKey),
+	})
+	if err != nil {
+		log.Printf("Global catalog not found: %v", err)
+		fmt.Printf("File %s not found in global catalog\n", fileName)
+		return
+	}
+	defer globalCatalogOut.Body.Close()
+	if err := json.NewDecoder(globalCatalogOut.Body).Decode(&catalog); err != nil {
+		log.Printf("Failed to parse global catalog: %v", err)
+		return
+	}
+
+	// Find the target file
+	for _, entry := range catalog {
+		if entry.FileName == fileName {
+			targetEntry = &entry
+			break
+		}
+	}
+	if targetEntry == nil {
+		fmt.Printf("File %s not found in global catalog\n", fileName)
+		return
+	}
+
+	// Acquire lock for file map deletion
+	lockKey := fmt.Sprintf("locks/global/%s.lock", fileName)
+	if err := acquireLock(ctx, client, lockKey, owner, cfg); err != nil {
+		log.Printf("Failed to acquire lock for %s: %v", fileName, err)
+		fmt.Printf("Cannot delete %s: failed to acquire lock\n", fileName)
+		return
+	}
+	defer releaseLock(ctx, client, lockKey, cfg)
+
+	// Delete file map
+	_, err = client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(cfg.BucketName),
+		Key:    aws.String(targetEntry.MapKey),
+	})
+	if err != nil {
+		log.Printf("Failed to delete file map %s: %v", targetEntry.MapKey, err)
+		fmt.Printf("Failed to delete file map for %s\n", fileName)
+		return
+	}
+
+	// Update global catalog
+	newCatalog := make([]CatalogEntry, 0, len(catalog)-1)
+	for _, entry := range catalog {
+		if entry.FileName != fileName {
+			newCatalog = append(newCatalog, entry)
+		}
+	}
+	jsonData, err := json.MarshalIndent(newCatalog, "", "  ")
+	if err != nil {
+		log.Printf("Failed to marshal new catalog: %v", err)
+		fmt.Printf("Failed to update global catalog for %s\n", fileName)
+		return
+	}
+	if err := putObj(ctx, client, cfg.CatalogKey, jsonData, cfg); err != nil {
+		log.Printf("Failed to update global catalog: %v", err)
+		fmt.Printf("Failed to update global catalog for %s\n", fileName)
+		return
+	}
+
+	fmt.Printf("Deleted file: %s\n", fileName)
+
+	// Clean up unreferenced blocks
+	cleanupLockKey := "locks/global/cleanup.lock"
+	if err := acquireLock(ctx, client, cleanupLockKey, owner, cfg); err != nil {
+		log.Printf("Failed to acquire cleanup lock: %v, skipping block cleanup", err)
+		return
+	}
+	defer releaseLock(ctx, client, cleanupLockKey, cfg)
+
+	referencedBlocks := make(map[string]struct{})
+	// Scan snapshot catalogs for blocks
+	paginator = s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(cfg.BucketName),
+		Prefix: aws.String("snapshots/"),
+	})
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			log.Printf("Failed to list snapshots for block cleanup: %v", err)
+			continue
+		}
+		for _, obj := range page.Contents {
+			if strings.HasSuffix(*obj.Key, "/catalog.json") {
+				snapshotCatalogKey := *obj.Key
+				out, err := client.GetObject(ctx, &s3.GetObjectInput{
+					Bucket: aws.String(cfg.BucketName),
+					Key:    aws.String(snapshotCatalogKey),
+				})
+				if err != nil {
+					log.Printf("Failed to get snapshot catalog %s: %v", snapshotCatalogKey, err)
+					continue
+				}
+				var snapshot SnapshotCatalog
+				if err := json.NewDecoder(out.Body).Decode(&snapshot); err != nil {
+					log.Printf("Failed to parse snapshot catalog %s: %v", snapshotCatalogKey, err)
+					out.Body.Close()
+					continue
+				}
+				out.Body.Close()
+				for _, entry := range snapshot.Files {
+					mapOut, err := client.GetObject(ctx, &s3.GetObjectInput{
+						Bucket: aws.String(cfg.BucketName),
+						Key:    aws.String(entry.MapKey),
+					})
+					if err != nil {
+						log.Printf("Failed to get file map %s: %v", entry.MapKey, err)
+						continue
+					}
+					var fm FileMap
+					if err := json.NewDecoder(mapOut.Body).Decode(&fm); err != nil {
+						log.Printf("Failed to parse file map %s: %v", entry.MapKey, err)
+						mapOut.Body.Close()
+						continue
+					}
+					mapOut.Body.Close()
+					for _, blockHash := range fm.Blocks {
+						referencedBlocks[blockHash] = struct{}{}
+					}
+				}
+			}
+		}
+	}
+
+	// Scan updated global catalog for blocks
+	for _, entry := range newCatalog {
+		mapOut, err := client.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: aws.String(cfg.BucketName),
+			Key:    aws.String(entry.MapKey),
+		})
+		if err != nil {
+			log.Printf("Failed to get file map %s: %v", entry.MapKey, err)
+			continue
+		}
+		var fm FileMap
+		if err := json.NewDecoder(mapOut.Body).Decode(&fm); err != nil {
+			log.Printf("Failed to parse file map %s: %v", entry.MapKey, err)
+			mapOut.Body.Close()
+			continue
+		}
+		mapOut.Body.Close()
+		for _, blockHash := range fm.Blocks {
+			referencedBlocks[blockHash] = struct{}{}
+		}
+	}
+
+	// Delete unreferenced blocks
 	blockPaginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
 		Bucket: aws.String(cfg.BucketName),
 		Prefix: aws.String("blocks/"),
