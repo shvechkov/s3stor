@@ -967,11 +967,6 @@ func deleteFile(ctx context.Context, client *s3.Client, owner, fileName string, 
 		}
 	}
 
-	// if _, inSnapshot := snapshotFiles[fileName]; inSnapshot {
-	// 	fmt.Printf("Cannot delete %s: referenced in a snapshot\n", fileName)
-	// 	return
-	// }
-
 	// Acquire global catalog lock
 	catalogLockKey := "locks/global/catalog.lock"
 	if err := acquireLock(ctx, client, catalogLockKey, owner, cfg); err != nil {

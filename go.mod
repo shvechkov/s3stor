@@ -1,4 +1,4 @@
-module shvechkov.com/s3clone/v2
+module shvechkov.com/s3stor/v2
 
 go 1.22
 
