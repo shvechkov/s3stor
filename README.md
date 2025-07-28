@@ -65,10 +65,10 @@ Jump to [Usage](#usage) for more examples or [Architecture](#architecture) for h
 - **Point-in-Time Snapshots**: Creates consistent backups using Volume Shadow Copy Service (VSS) on Windows, with independent file maps for each snapshot.
 - **Multi-Writer Safety**: Uses S3-based locking to prevent conflicts when multiple instances (e.g., on different machines) access the same bucket.
 - **File Management**:
-  - `sync`: Upload files to S3 with deduplication.
-  - `ls`: List files in global catalog or snapshots.
+  - `sync`: Upload files to S3 with deduplication, creating global catalog if missing.
+  - `ls`: List files in global catalog or snapshots, creating global catalog if missing.
   - `get`: Restore files from snapshots or global catalog.
-  - `map`: Display block mappings for a file.
+  - `map`: Display block mappings for a file in global catalog or a snapshot.
   - `snapshot`: Create snapshots of specified files.
   - `delete-snapshot`: Remove snapshots and their metadata.
   - `delete`: Remove files from global catalog with safe block cleanup.
@@ -82,52 +82,56 @@ Jump to [Usage](#usage) for more examples or [Architecture](#architecture) for h
 ### Components
 1. **Global Catalog (`catalog.json`)**:
    - Stores metadata for files synced via `sync`.
+   - Automatically created as an empty catalog (`[]`) on first `sync` or `ls` if not found.
    - Format: JSON array of entries:
      ```json
      [
        {
-         "FileName": "file1.txt",
-         "FileSize": 123,
-         "MapKey": "maps/file1.txt.json"
+         "file_name": "file1.txt",
+         "file_size": 123,
+         "map_key": "maps/file1.txt.json"
        },
        {
-         "FileName": "d001/f005.txt",
-         "FileSize": 456,
-         "MapKey": "maps/d001/f005.txt.json"
+         "file_name": "d001/f005.txt",
+         "file_size": 456,
+         "map_key": "maps/d001/f005.txt.json"
        }
      ]
      ```
-   - `MapKey` points to a file map listing block hashes.
+   - `map_key` points to a file map listing block hashes.
 
 2. **File Maps (`maps/<file_name>.json`)**:
-   - For each file in the global catalog, stores a list of SHA-256 block hashes:
+   - For each file in the global catalog, stores metadata and a list of SHA-256 block hashes:
      ```json
      {
-       "Blocks": ["a1b2c3d4...", "e5f6g7h8..."]
+       "file_name": "file1.txt",
+       "file_size": 123,
+       "block_size": 1048576,
+       "blocks": ["a1b2c3d4...", "e5f6g7h8..."]
      }
      ```
    - Blocks are stored in `blocks/<hash>`.
 
-3. **Snapshot Catalog (`snapshots/<snapshot_id>/catalog.json`)**:
-   - Created by `snapshot`, stores metadata for files in a snapshot (e.g., `sandow-sn001`).
+3. **Snapshot Catalog (`<hostname>/snapshots/<snapshot_id>/catalog.json`)**:
+   - Created by `snapshot`, stores metadata for files in a snapshot (e.g., `sandow/snapshots/sandow-sn001`).
    - Format: JSON object:
      ```json
      {
-       "SnapshotID": "sandow-sn001",
-       "CreatedBy": "sandow",
-       "CreatedAt": "2025-07-27T22:50:00Z",
-       "Files": [
+       "snapshot_id": "sandow-sn001",
+       "timestamp": "2025-07-27T22:50:00Z",
+       "computer_id": "sandow",
+       "files": [
          {
-           "FileName": "file1.txt",
-           "FileSize": 123,
-           "MapKey": "snapshots/sandow-sn001/maps/file1.txt.json"
+           "file_name": "file1.txt",
+           "file_size": 123,
+           "map_key": "sandow/snapshots/sandow-sn001/maps/file1.txt.json"
          }
        ]
      }
      ```
    - Independent of global catalog, with separate file maps.
 
-4. **Snapshot File Maps (`snapshots/<snapshot_id>/maps/<file_name>.json`)**:
+4. **Snapshot File Maps (`<hostname>/snapshots/<snapshot_id>/maps/<file_name>.json`)**:
    - Similar to global file maps, lists block hashes for snapshot files.
    - Ensures snapshots are self-contained, unaffected by global catalog changes.
 
@@ -135,7 +139,7 @@ Jump to [Usage](#usage) for more examples or [Architecture](#architecture) for h
    - Stores unique file blocks, identified by SHA-256 hashes.
    - Deduplication ensures identical blocks are stored only once, referenced by multiple file maps.
 
-6. **Locks (`locks/global/<resource>.lock`)**:
+6. **Locks (`locks/global/<resource>.lock`, `locks/<hostname>/snapshots/<snapshot_id>/<resource>.lock`)**:
    - S3 objects used for concurrency control (e.g., `locks/global/catalog.lock`, `locks/global/file1.txt.lock`).
    - Prevents race conditions in multi-writer scenarios (e.g., multiple `s3stor` instances).
    - Automatically expire via S3 lifecycle policy (1-day retention).
@@ -145,22 +149,22 @@ Jump to [Usage](#usage) for more examples or [Architecture](#architecture) for h
   1. Read local file, split into blocks, compute SHA-256 hashes.
   2. Upload new blocks to `blocks/<hash>` if not already present.
   3. Create file map (`maps/<file_name>.json`) listing block hashes.
-  4. Update `catalog.json` with file metadata.
+  4. Create or update `catalog.json` with file metadata.
 - **Snapshot**:
   1. Use VSS (Windows) for consistent file access.
-  2. Create snapshot catalog (`snapshots/<snapshot_id>/catalog.json`).
-  3. Copy or create file maps in `snapshots/<snapshot_id>/maps/`.
+  2. Create snapshot catalog (`<hostname>/snapshots/<snapshot_id>/catalog.json`).
+  3. Copy or create file maps in `<hostname>/snapshots/<snapshot_id>/maps/`.
   4. Reuse existing blocks in `blocks/<hash>`.
 - **Delete**:
   1. Remove file from `catalog.json` and delete its file map.
   2. Clean up unreferenced blocks by checking all file maps (global and snapshot).
 - **Get**:
-  1. Read file map to get block hashes.
+  1. Read file map (from global catalog or snapshot) to get block hashes.
   2. Download blocks from `blocks/<hash>`.
   3. Reconstruct file locally.
 
 ### Deduplication
-- Files are split into fixed-size blocks (implementation-specific, e.g., 4MB).
+- Files are split into fixed-size blocks (default: 1MB).
 - Each block’s SHA-256 hash is computed and stored in `blocks/<hash>`.
 - File maps reference these blocks, enabling deduplication across files and snapshots.
 - Example: If `file1.txt` and `file2.txt` share a block, it’s stored once in `blocks/a1b2c3d4...` and referenced by both file maps.
@@ -180,7 +184,7 @@ Jump to [Usage](#usage) for more examples or [Architecture](#architecture) for h
 4. **Verify**:
    ```bash
    ./s3stor
-   # Output: Usage: s3stor <sync|ls|get|map|snapshot|delete-snapshot|cleanup-blocks|delete> [args...]
+   # Output: Usage: go run main.go <sync|ls|get|map|snapshot|delete-snapshot|cleanup-blocks|delete> [args...]
    ```
 
 ## Configuration
@@ -224,17 +228,17 @@ s3stor <command> [args...]
 
 ### Commands
 - **sync <file_or_dir>**:
-  - Uploads files to S3 with deduplication.
+  - Uploads files to S3 with deduplication, creating global catalog if missing.
   - Example: `./s3stor sync test_out/file1.txt`
 - **ls [snapshot_id]**:
-  - Lists files in global catalog or a snapshot.
-  - Example: `./s3stor ls sandow-sn001`
-- **get <snapshot_id> <file_name> <output_dir>**:
-  - Restores a file from a snapshot or global catalog.
-  - Example: `./s3stor get sandow-sn001 file1.txt ./restore`
-- **map <file_name>**:
-  - Displays block mappings for a file in the global catalog.
-  - Example: `./s3stor map file1.txt`
+  - Lists files in global catalog (creates empty catalog if missing) or a specific snapshot.
+  - Example: `./s3stor ls` or `./s3stor ls sandow-sn001`
+- **get [<snapshot_id>] <file_name> <output_dir>**:
+  - Restores a file from a snapshot (if `snapshot_id` provided) or global catalog.
+  - Example: `./s3stor get sandow-sn001 file1.txt ./restore` or `./s3stor get file1.txt ./restore`
+- **map [<snapshot_id>] <file_name>**:
+  - Displays block mappings for a file in the global catalog or a snapshot (if `snapshot_id` provided).
+  - Example: `./s3stor map file1.txt` or `./s3stor map sandow-sn001 file1.txt`
 - **snapshot <source_dir> <snapshot_id> [file_names...]**:
   - Creates a snapshot of specified files using VSS (Windows).
   - Example: `./s3stor snapshot test_out sn001 file1.txt`
@@ -267,12 +271,15 @@ Create a snapshot of specific files:
 ```
 
 ### 3. List Files
-List files in the global catalog:
+List files in the global catalog (creates empty catalog if none exists):
 ```bash
 ./s3stor ls
 # Output: Files in global catalog:
 #         - file1.txt (123 bytes)
 #         - d001/f005.txt (456 bytes)
+# If no catalog exists:
+# Output: Files in global catalog:
+#         (none)
 ```
 
 List files in a snapshot:
@@ -283,14 +290,45 @@ List files in a snapshot:
 #         - d001/f005.txt (456 bytes)
 ```
 
-### 4. Restore a File
+### 4. View File Map
+View block mappings for a file in the global catalog:
+```bash
+./s3stor map file1.txt
+# Output: File Map for file1.txt:
+#         File Name: file1.txt
+#         File Size: 123 bytes
+#         Block Size: 1048576 bytes
+#         Blocks:
+#           1: a1b2c3d4...
+#           2: e5f6g7h8...
+```
+
+View block mappings for a file in a snapshot:
+```bash
+./s3stor map sandow-sn001 file1.txt
+# Output: File Map for file1.txt:
+#         File Name: file1.txt
+#         File Size: 123 bytes
+#         Block Size: 1048576 bytes
+#         Blocks:
+#           1: a1b2c3d4...
+#           2: e5f6g7h8...
+```
+
+### 5. Restore a File
 Restore a file from a snapshot:
 ```bash
 ./s3stor get sandow-sn001 file1.txt ./restore
 # Output: File reconstructed to: ./restore/file1.txt
 ```
 
-### 5. Delete a File
+Restore a file from the global catalog:
+```bash
+./s3stor get file1.txt ./restore
+# Output: File reconstructed to: ./restore/file1.txt
+```
+
+### 6. Delete a File
 Remove a file from the global catalog:
 ```bash
 ./s3stor delete file1.txt
@@ -298,15 +336,14 @@ Remove a file from the global catalog:
 #         Block cleanup completed: 0 blocks deleted
 ```
 
-### 6. Delete a Snapshot
+### 7. Delete a Snapshot
 Remove a snapshot:
 ```bash
 ./s3stor delete-snapshot sandow-sn001
-# Output: Deleted snapshot: sandow-sn001
-#         Block cleanup completed: 1 blocks deleted
+# Output: Snapshot sandow-sn001 deleted
 ```
 
-### 7. Clean Up Blocks
+### 8. Clean Up Blocks
 Manually clean unreferenced blocks:
 ```bash
 ./s3stor cleanup-blocks
@@ -324,24 +361,29 @@ your-bucket-name/
 ├── blocks/
 │   ├── a1b2c3d4...
 │   ├── e5f6g7h8...
-├── snapshots/
-│   ├── sandow-sn001/
-│   │   ├── catalog.json
-│   │   ├── maps/
-│   │   │   ├── file1.txt.json
-│   │   │   ├── d001/f005.txt.json
+├── <hostname>/
+│   ├── snapshots/
+│   │   ├── sandow-sn001/
+│   │   │   ├── catalog.json
+│   │   │   ├── maps/
+│   │   │   │   ├── file1.txt.json
+│   │   │   │   ├── d001/f005.txt.json
 ├── locks/
 │   ├── global/
 │   │   ├── catalog.lock
 │   │   ├── file1.txt.lock
 │   │   ├── cleanup.lock
+│   ├── <hostname>/
+│   │   ├── snapshots/
+│   │   │   ├── sandow-sn001/
+│   │   │   │   ├── file1.txt.lock
 ```
 
 ## Locking Mechanism
 - **Purpose**: Ensures thread-safety in multi-writer scenarios (e.g., multiple `s3stor` instances on `sandow` or other machines).
-- **Implementation**: S3 objects (`locks/global/<resource>.lock`) act as mutexes.
+- **Implementation**: S3 objects (`locks/global/<resource>.lock`, `locks/<hostname>/snapshots/<snapshot_id>/<resource>.lock`) act as mutexes.
   - Example: `locks/global/catalog.lock` for global catalog updates.
-  - `locks/global/file1.txt.lock` for file-specific operations.
+  - Example: `locks/sandow/snapshots/sandow-sn001/file1.txt.lock` for snapshot file operations.
 - **Acquisition**:
   - Attempts to write lock object with a unique owner (e.g., hostname `sandow`).
   - Retries (default: 3 attempts) if locked by another instance.
@@ -355,11 +397,14 @@ your-bucket-name/
   - **Fix**:
     - Verify files: `ls test_out/file1.txt`.
     - Check VSS permissions (Windows): Run as administrator.
-    - List locks: `aws s3 ls s3://your-bucket-name/locks/global/`.
+    - List locks: `aws s3 ls s3://your-bucket-name/locks/`.
     - Remove stuck locks: `aws s3 rm s3://your-bucket-name/locks/global/file1.txt.lock`.
 - **File Not Found in Catalog**:
   - **Cause**: File not synced or deleted.
   - **Fix**: Run `./s3stor ls` to check catalog, then `sync` the file.
+- **Global Catalog Not Found**:
+  - **Cause**: No prior `sync` or `ls` commands executed.
+  - **Fix**: Run `./s3stor ls` or `./s3stor sync <file>` to create an empty catalog.
 - **Lock Acquisition Fails**:
   - **Cause**: Another instance holds the lock.
   - **Fix**: Wait and retry, or increase `maxLockRetries` in code (default: 3).
@@ -380,4 +425,4 @@ your-bucket-name/
   - Add man page: `man s3stor`.
 
 ## License
-MIT License (or your preferred license). See [LICENSE](LICENSE) for details.
+MIT License. See [LICENSE](LICENSE) for details.

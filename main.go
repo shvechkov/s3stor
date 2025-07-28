@@ -183,12 +183,18 @@ func main() {
 		}
 		getFile(ctx, client, snapshotID, fileName, outDir, providerConfig)
 	case "map":
-		if len(os.Args) < 3 {
-			fmt.Println("Usage: map <file_name>")
+		if len(os.Args) < 3 || len(os.Args) > 4 {
+			fmt.Println("Usage: map [<snapshot_id>] <file_name>")
 			os.Exit(1)
 		}
-		fileName := os.Args[2]
-		getFileMap(ctx, client, fileName, providerConfig)
+		var snapshotID, fileName string
+		if len(os.Args) == 4 {
+			snapshotID = os.Args[2]
+			fileName = os.Args[3]
+		} else {
+			fileName = os.Args[2]
+		}
+		getFileMap(ctx, client, snapshotID, fileName, providerConfig)
 	case "snapshot":
 		if len(os.Args) < 4 {
 			fmt.Println("Usage: snapshot <dir> <snapshot_id> [changed_files...]")
@@ -202,8 +208,7 @@ func main() {
 			log.Printf("Failed to get hostname: %v, using 'unknown'", err)
 			hostname = "unknown"
 		}
-		uniqueSnapshotID := fmt.Sprintf("%s-%s", hostname, snapshotID)
-		createSnapshot(ctx, client, uploader, dir, uniqueSnapshotID, changedFiles, providerConfig)
+		createSnapshot(ctx, client, uploader, dir, snapshotID, hostname, changedFiles, providerConfig)
 	case "delete-snapshot":
 		if len(os.Args) != 3 {
 			fmt.Println("Usage: delete-snapshot <snapshot_id>")
@@ -431,7 +436,10 @@ func updateCatalog(ctx context.Context, client *s3.Client, fm FileMap, mapKey st
 		Bucket: aws.String(cfg.BucketName),
 		Key:    aws.String(cfg.CatalogKey),
 	})
-	if err == nil {
+	if err != nil {
+		// If catalog doesn't exist, create an empty one
+		log.Printf("Global catalog not found, creating new: %v", err)
+	} else {
 		defer out.Body.Close()
 		if err := json.NewDecoder(out.Body).Decode(&catalog); err != nil {
 			return fmt.Errorf("catalog decode error: %w", err)
@@ -461,9 +469,14 @@ func updateCatalog(ctx context.Context, client *s3.Client, fm FileMap, mapKey st
 }
 
 func listFiles(ctx context.Context, client *s3.Client, cfg S3ProviderConfig) {
+	hostname, err := os.Hostname()
+	if err != nil {
+		log.Printf("Failed to get hostname: %v, using 'unknown'", err)
+		hostname = "unknown"
+	}
 	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
 		Bucket: aws.String(cfg.BucketName),
-		Prefix: aws.String("snapshots/"),
+		Prefix: aws.String(fmt.Sprintf("%s/snapshots/", hostname)),
 	})
 	var snapshots []string
 	for paginator.HasMorePages() {
@@ -474,7 +487,7 @@ func listFiles(ctx context.Context, client *s3.Client, cfg S3ProviderConfig) {
 		}
 		for _, obj := range page.Contents {
 			if strings.HasSuffix(*obj.Key, "/catalog.json") {
-				snapshotID := strings.TrimPrefix(strings.TrimSuffix(*obj.Key, "/catalog.json"), "snapshots/")
+				snapshotID := strings.TrimPrefix(strings.TrimSuffix(*obj.Key, "/catalog.json"), fmt.Sprintf("%s/snapshots/", hostname))
 				snapshots = append(snapshots, snapshotID)
 			}
 		}
@@ -487,20 +500,29 @@ func listFiles(ctx context.Context, client *s3.Client, cfg S3ProviderConfig) {
 		}
 	}
 
+	var catalog []CatalogEntry
 	out, err := client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(cfg.BucketName),
 		Key:    aws.String(cfg.CatalogKey),
 	})
 	if err != nil {
-		log.Println("Global catalog not found:", err)
-		return
-	}
-	defer out.Body.Close()
-
-	var catalog []CatalogEntry
-	if err := json.NewDecoder(out.Body).Decode(&catalog); err != nil {
-		log.Println("Failed to parse global catalog:", err)
-		return
+		// If catalog doesn't exist, create an empty one
+		log.Printf("Global catalog not found, creating new ...")
+		jsonData, err := json.MarshalIndent(catalog, "", "  ")
+		if err != nil {
+			log.Printf("Failed to marshal empty catalog: %v", err)
+			return
+		}
+		if err := putObj(ctx, client, cfg.CatalogKey, jsonData, cfg); err != nil {
+			log.Printf("Failed to create global catalog: %v", err)
+			return
+		}
+	} else {
+		defer out.Body.Close()
+		if err := json.NewDecoder(out.Body).Decode(&catalog); err != nil {
+			log.Println("Failed to parse global catalog:", err)
+			return
+		}
 	}
 
 	fmt.Println("Files in global catalog:")
@@ -510,7 +532,12 @@ func listFiles(ctx context.Context, client *s3.Client, cfg S3ProviderConfig) {
 }
 
 func listSnapshotFiles(ctx context.Context, client *s3.Client, snapshotID string, cfg S3ProviderConfig) {
-	snapshotCatalogKey := fmt.Sprintf("snapshots/%s/catalog.json", snapshotID)
+	hostname, err := os.Hostname()
+	if err != nil {
+		log.Printf("Failed to get hostname: %v, using 'unknown'", err)
+		hostname = "unknown"
+	}
+	snapshotCatalogKey := fmt.Sprintf("%s/snapshots/%s/catalog.json", hostname, snapshotID)
 	out, err := client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(cfg.BucketName),
 		Key:    aws.String(snapshotCatalogKey),
@@ -535,8 +562,13 @@ func listSnapshotFiles(ctx context.Context, client *s3.Client, snapshotID string
 
 func getFile(ctx context.Context, client *s3.Client, snapshotID, fileName, outDir string, cfg S3ProviderConfig) {
 	var mapKey string
+	hostname, err := os.Hostname()
+	if err != nil {
+		log.Printf("Failed to get hostname: %v, using 'unknown'", err)
+		hostname = "unknown"
+	}
 	if snapshotID != "" {
-		mapKey = fmt.Sprintf("snapshots/%s/maps/%s.json", snapshotID, fileName)
+		mapKey = fmt.Sprintf("%s/snapshots/%s/maps/%s.json", hostname, snapshotID, fileName)
 	} else {
 		mapKey = fmt.Sprintf("maps/%s.json", fileName)
 	}
@@ -590,8 +622,18 @@ func getFile(ctx context.Context, client *s3.Client, snapshotID, fileName, outDi
 	fmt.Printf("File reconstructed to: %s\n", outPath)
 }
 
-func getFileMap(ctx context.Context, client *s3.Client, fileName string, cfg S3ProviderConfig) {
-	mapKey := fmt.Sprintf("maps/%s.json", fileName)
+func getFileMap(ctx context.Context, client *s3.Client, snapshotID, fileName string, cfg S3ProviderConfig) {
+	var mapKey string
+	if snapshotID != "" {
+		hostname, err := os.Hostname()
+		if err != nil {
+			log.Printf("Failed to get hostname: %v, using 'unknown'", err)
+			hostname = "unknown"
+		}
+		mapKey = fmt.Sprintf("%s/snapshots/%s/maps/%s.json", hostname, snapshotID, fileName)
+	} else {
+		mapKey = fmt.Sprintf("maps/%s.json", fileName)
+	}
 	out, err := client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(cfg.BucketName),
 		Key:    aws.String(mapKey),
@@ -618,12 +660,7 @@ func getFileMap(ctx context.Context, client *s3.Client, fileName string, cfg S3P
 	}
 }
 
-func createSnapshot(ctx context.Context, client *s3.Client, uploader *manager.Uploader, dir, snapshotID string, changedFiles []string, cfg S3ProviderConfig) {
-	hostname, err := os.Hostname()
-	if err != nil {
-		log.Printf("Failed to get hostname: %v, using 'unknown'", err)
-		hostname = "unknown"
-	}
+func createSnapshot(ctx context.Context, client *s3.Client, uploader *manager.Uploader, dir, snapshotID, hostname string, changedFiles []string, cfg S3ProviderConfig) {
 	snapshotCatalog := SnapshotCatalog{
 		SnapshotID: snapshotID,
 		Timestamp:  time.Now(),
@@ -676,7 +713,7 @@ func createSnapshot(ctx context.Context, client *s3.Client, uploader *manager.Up
 			continue
 		}
 
-		lockKey := fmt.Sprintf("locks/snapshots/%s/%s.lock", snapshotID, relPath)
+		lockKey := fmt.Sprintf("locks/%s/snapshots/%s/%s.lock", hostname, snapshotID, relPath)
 		if err := acquireLock(ctx, client, lockKey, hostname, cfg); err != nil {
 			log.Printf("Skipping file %s due to lock failure: %v", relPath, err)
 			continue
@@ -711,7 +748,7 @@ func createSnapshot(ctx context.Context, client *s3.Client, uploader *manager.Up
 			Blocks:    blocks,
 		}
 
-		mapKey := fmt.Sprintf("snapshots/%s/maps/%s.json", snapshotID, relPath)
+		mapKey := fmt.Sprintf("%s/snapshots/%s/maps/%s.json", hostname, snapshotID, relPath)
 		mapJSON, err := json.Marshal(fm)
 		if err != nil {
 			log.Printf("JSON marshal error for %s: %v", fullPath, err)
@@ -729,7 +766,7 @@ func createSnapshot(ctx context.Context, client *s3.Client, uploader *manager.Up
 		})
 	}
 
-	snapshotCatalogKey := fmt.Sprintf("snapshots/%s/catalog.json", snapshotID)
+	snapshotCatalogKey := fmt.Sprintf("%s/snapshots/%s/catalog.json", hostname, snapshotID)
 	jsonData, err := json.MarshalIndent(snapshotCatalog, "", "  ")
 	if err != nil {
 		log.Printf("Snapshot catalog JSON marshal error: %v", err)
@@ -744,7 +781,12 @@ func createSnapshot(ctx context.Context, client *s3.Client, uploader *manager.Up
 }
 
 func deleteSnapshot(ctx context.Context, client *s3.Client, snapshotID string, cfg S3ProviderConfig) {
-	snapshotCatalogKey := fmt.Sprintf("snapshots/%s/catalog.json", snapshotID)
+	hostname, err := os.Hostname()
+	if err != nil {
+		log.Printf("Failed to get hostname: %v, using 'unknown'", err)
+		hostname = "unknown"
+	}
+	snapshotCatalogKey := fmt.Sprintf("%s/snapshots/%s/catalog.json", hostname, snapshotID)
 	out, err := client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(cfg.BucketName),
 		Key:    aws.String(snapshotCatalogKey),
@@ -785,7 +827,7 @@ func deleteSnapshot(ctx context.Context, client *s3.Client, snapshotID string, c
 	// Clean up locks
 	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
 		Bucket: aws.String(cfg.BucketName),
-		Prefix: aws.String(fmt.Sprintf("locks/snapshots/%s/", snapshotID)),
+		Prefix: aws.String(fmt.Sprintf("locks/%s/snapshots/%s/", hostname, snapshotID)),
 	})
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
@@ -821,7 +863,7 @@ func cleanupBlocks(ctx context.Context, client *s3.Client, owner string, cfg S3P
 	// 1. Scan snapshot catalogs
 	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
 		Bucket: aws.String(cfg.BucketName),
-		Prefix: aws.String("snapshots/"),
+		Prefix: aws.String(fmt.Sprintf("%s/snapshots/", owner)),
 	})
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
@@ -946,7 +988,7 @@ func deleteFile(ctx context.Context, client *s3.Client, owner, fileName string, 
 	snapshotFiles := make(map[string]struct{})
 	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
 		Bucket: aws.String(cfg.BucketName),
-		Prefix: aws.String("snapshots/"),
+		Prefix: aws.String(fmt.Sprintf("%s/snapshots/", owner)),
 	})
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
@@ -1069,7 +1111,7 @@ func deleteFile(ctx context.Context, client *s3.Client, owner, fileName string, 
 	// Scan snapshot catalogs for blocks
 	paginator = s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
 		Bucket: aws.String(cfg.BucketName),
-		Prefix: aws.String("snapshots/"),
+		Prefix: aws.String(fmt.Sprintf("%s/snapshots/", owner)),
 	})
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
