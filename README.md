@@ -13,7 +13,7 @@ go build -o s3stor
 
 # Configure Wasabi (or other S3-compatible storage)
 export S3_PROVIDER=wasabi
-export S3_BUCKET=arcserve-cd-poc
+export S3_BUCKET=your-bucket-name
 export S3_REGION=us-east-1
 export S3_ENDPOINT=https://s3.us-east-1.wasabisys.com
 export AWS_ACCESS_KEY_ID=your-wasabi-access-key
@@ -187,7 +187,7 @@ Jump to [Usage](#usage) for more examples or [Architecture](#architecture) for h
 `s3stor` uses environment variables for S3 configuration. Example for Wasabi:
 ```bash
 export S3_PROVIDER=wasabi
-export S3_BUCKET=arcserve-cd-poc
+export S3_BUCKET=your-bucket-name
 export S3_REGION=us-east-1
 export S3_ENDPOINT=https://s3.us-east-1.wasabisys.com
 export AWS_ACCESS_KEY_ID=your-wasabi-access-key
@@ -200,14 +200,14 @@ Ensure your S3 credentials allow:
 {
   "Effect": "Allow",
   "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject", "s3:ListBucket"],
-  "Resource": ["arn:aws:s3:::arcserve-cd-poc/*", "arn:aws:s3:::arcserve-cd-poc"]
+  "Resource": ["arn:aws:s3:::your-bucket-name/*", "arn:aws:s3:::your-bucket-name"]
 }
 ```
 
 ### Lock Expiration
 Set an S3 lifecycle policy to expire locks after 1 day:
 ```bash
-aws s3api put-bucket-lifecycle-configuration --bucket arcserve-cd-poc --lifecycle-configuration '{
+aws s3api put-bucket-lifecycle-configuration --bucket your-bucket-name --lifecycle-configuration '{
   "Rules": [{
     "ID": "CleanLocks",
     "Status": "Enabled",
@@ -314,9 +314,9 @@ Manually clean unreferenced blocks:
 ```
 
 ## S3 Bucket Structure
-After running commands, your bucket (`arcserve-cd-poc`) will have:
+After running commands, your bucket (`your-bucket-name`) will have:
 ```
-arcserve-cd-poc/
+your-bucket-name/
 ├── catalog.json
 ├── maps/
 │   ├── file1.txt.json
@@ -355,8 +355,8 @@ arcserve-cd-poc/
   - **Fix**:
     - Verify files: `ls test_out/file1.txt`.
     - Check VSS permissions (Windows): Run as administrator.
-    - List locks: `aws s3 ls s3://arcserve-cd-poc/locks/global/`.
-    - Remove stuck locks: `aws s3 rm s3://arcserve-cd-poc/locks/global/file1.txt.lock`.
+    - List locks: `aws s3 ls s3://your-bucket-name/locks/global/`.
+    - Remove stuck locks: `aws s3 rm s3://your-bucket-name/locks/global/file1.txt.lock`.
 - **File Not Found in Catalog**:
   - **Cause**: File not synced or deleted.
   - **Fix**: Run `./s3stor ls` to check catalog, then `sync` the file.
