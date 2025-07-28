@@ -1,3 +1,15 @@
+/*
+ * Project: s3stor
+ * Description: Command-line tool for syncing files to Wasabi S3-compatible storage.
+ *
+ * Created by: Alexey Shvechkov <alexey@shvechkov.com>
+ * License: MIT
+ *
+ * © 2025 Alexey Shvechkov. All rights reserved.
+ */
+
+// Source: https://github.com/shvechkov/s3stor
+
 package main
 
 import (
